@@ -1,47 +1,68 @@
-import os, re, requests
-from flask import Flask, request, Response, abort
+import re, requests
+from flask import Flask, request, Response, abort, make_response
 from flask_cors import CORS
+from urllib.parse import urlparse
 
 app = Flask(__name__)
-CORS(app)  # 모든 오리진 허용 (필요시 도메인 제한)
+CORS(app, resources={r"/proxy": {"origins": "*"}})
 
-# (선택) 보안상 허용 도메인 화이트리스트
-ALLOW_RE = re.compile(
-    r"^(https:\/\/)"
-    r"("
-    r"(www\.)?korea\.kr"
-    r"|www\.mois\.go\.kr"
-    r"|www\.mohw\.go\.kr"
-    r"|gnews\.gg\.go\.kr"
-    r"|.*\.go\.kr"
-    r")\/", re.IGNORECASE
-)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/127.0.0.0 Safari/537.36")
 
-@app.get("/proxy")
+COMMON_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.korea.kr/",
+}
+
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept"
+    resp.headers["Access-Control-Expose-Headers"] = "Content-Type"
+    return resp
+
+@app.route("/proxy", methods=["GET", "OPTIONS"])
 def proxy():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     url = request.args.get("url", "")
     if not url:
         abort(400, "missing url")
 
-    # (선택) 허용 도메인만 통과
-    if not ALLOW_RE.match(url):
-        abort(403, "blocked by whitelist")
+    def fetch_once(u):
+        return requests.get(
+            u, timeout=12, allow_redirects=True, headers=COMMON_HEADERS
+        )
 
-    try:
-        # 서버에서 직접 받아오기 (리다이렉트 허용)
-        r = requests.get(url, timeout=10, allow_redirects=True, headers={
-            "User-Agent": "Mozilla/5.0 (RSS Proxy)"
-        })
-    except requests.RequestException as e:
-        abort(502, f"upstream error: {e}")
+    r = fetch_once(url)
 
-    # 원본의 content-type을 최대한 전달
-    ctype = r.headers.get("Content-Type", "application/xml; charset=utf-8")
-    # 텍스트 류만 통과 (보안)
-    if not any(s in ctype for s in ["xml", "html", "text", "application/rss+xml", "application/atom+xml"]):
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    text_head = r.text[:500] if "xml" not in ctype else ""
+
+    # ⚠️ korea.kr이 에러 HTML을 준 경우 → m.korea.kr RSS로 폴백
+    host = urlparse(url).hostname or ""
+    if ("korea.kr" in host) and ("xml" not in ctype):
+        # 에러 HTML 내 alternate 링크 탐색
+        m = re.search(r'href="(https://m\.korea\.kr/[^"]+pressRelease\.do[^"]*)"', r.text, re.I)
+        alt = m.group(1) if m else "https://m.korea.kr/rss/pressRelease.do"
+        r2 = fetch_once(alt)
+        # r2로 덮어쓰기
+        r = r2
+        ctype = (r.headers.get("Content-Type") or "").lower()
+
+    # Content-Type 정리
+    if not re.search(r"(xml|rss|atom|text|html)", ctype):
         ctype = "application/xml; charset=utf-8"
 
-    return Response(r.content, status=r.status_code, content_type=ctype)
+    resp = make_response(r.content, r.status_code)
+    resp.headers["Content-Type"] = ctype
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 @app.get("/")
 def health():
