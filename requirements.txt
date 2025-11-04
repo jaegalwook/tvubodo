@@ -1,5 +1,5 @@
 flask
 flask-cors
-requests
-feedparser
 gunicorn
+openai>=1.40.0
+python-dotenv
